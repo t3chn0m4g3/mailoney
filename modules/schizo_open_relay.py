@@ -10,10 +10,10 @@ import sys
 import errno
 import time
 import threading
-
+from time import gmtime, strftime
 import asyncore
 import asynchat
-
+import re
 import json
 
 sys.path.append("../")
@@ -28,12 +28,38 @@ def string_escape(s, encoding='utf-8'):
              .encode('latin1')         # 1:1 mapping back to bytes
              .decode(encoding))        # Decode original encoding
 
+# def log_to_file(file_path, ip, port, data):
+    # with output_lock:
+        # with open(file_path, "a") as f:
+            # message = "[{0}][{1}:{2}] {3}".format(time.time(), ip, port, string_escape(data))
+            # print(file_path + " " + message)
+            # f.write(message + "\n")
+
 def log_to_file(file_path, ip, port, data):
     with output_lock:
-        with open(file_path, "a") as f:
-            message = "[{0}][{1}:{2}] {3}".format(time.time(), ip, port, string_escape(data))
-            print(file_path + " " + message)
-            f.write(message + "\n")
+        try:
+            with open(file_path, "a") as f:
+                # Find all email addresses in the data
+                emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}\b', data)
+                if len(data) > 4096:
+                    data = "BIGSIZE"
+                dictmap = {
+                    'timestamp': strftime("20%y-%m-%dT%H:%M:%S.000000Z", gmtime()), 
+                    'src_ip': ip, 
+                    'src_port': port,  
+                    'data': data, 
+                    'smtp_input': emails
+                }
+                # Serialize the dictionary to a JSON-formatted string
+                json_data = json.dumps(dictmap)
+                f.write(json_data + '\n')
+                # Format the message for logging
+                message = "[{0}][{1}:{2}] {3}".format(time(), ip, port, repr(data))
+                # Log the message to console
+                print(file_path + " " + message)
+        except Exception as e:
+            # Log the error (or pass a specific message)
+            print("An error occurred while logging to file: ", str(e))
 
 def log_to_hpfeeds(channel, data):
         if hpc:
@@ -88,7 +114,8 @@ class SMTPChannel(asynchat.async_chat):
             # a race condition  may occur if the other end is closing
             # before we can get the peername
             self.close()
-            if err[0] != errno.ENOTCONN:
+            # Instead of directly subscripting the err, use err.errno to get the error code.
+            if err.errno != errno.ENOTCONN:
                 raise
             return
         #print(>> DEBUGSTREAM, 'Peer:', repr(self.__peer))
