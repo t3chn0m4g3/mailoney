@@ -1,4 +1,5 @@
 __author__ = '@awhitehatter'
+__author__ = '@referefref'
 
 '''
 Open relay module, will dump emails into a message log file
@@ -8,39 +9,41 @@ https://djangosnippets.org/snippets/96/
 https://muffinresearch.co.uk/fake-smtp-server-with-python/ (@muffinresearch)
 '''
 
-import sys
+import asyncio
 import os
-import asyncore
-from smtpd import SMTPServer
+from aiosmtpd.controller import Controller
+from aiosmtpd.handlers import Message
 
-def or_module():
+class OpenRelayHandler(Message):
+    async def handle_DATA(self, server, session, envelope):
+        peer = session.peer
+        mailfrom = envelope.mail_from
+        rcpttos = envelope.rcpt_tos
+        data = envelope.content.decode('utf8', errors='replace')
 
-    class OpenRelay(SMTPServer):
-
-        def process_message(self, peer, mailfrom, rcpttos, data, mail_options=None,rcpt_options=None):
-            #setup the Log File
-            if os.path.exists('logs/mail.log'):
-                logfile = open('logs/mail.log', 'a')
-            else:
-                logfile = open('logs/mail.log', 'w')
+        # Setup the Log File
+        log_file_path = 'logs/mail.log'
+        if not os.path.exists(log_file_path):
+            os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+        with open(log_file_path, 'a') as logfile:
             logfile.write('\n\n' + '*' * 50 + '\n')
             logfile.write('IP Address: {}\n'.format(peer[0]))
-            logfile.write('Mail to: {}\n'.format(mailfrom))
-            #Need to loop through rcpts if more than one is given
-            logfile.write('Mail from: {}\n'.format(rcpttos[0]))
-            logfile.write('Data:\n')
-            logfile.write('\n')
-            logfile.write(data.decode("utf-8"))
-            logfile.close
+            logfile.write('Mail from: {}\n'.format(mailfrom))
+            for recipient in rcpttos:
+                logfile.write('Mail to: {}\n'.format(recipient))
+            logfile.write('Data:\n{}\n'.format(data))
+        return '250 Message accepted for delivery'
 
-    def run():
-        sys.path.append("../")
-        import mailoney
+def run():
+    sys.path.append("../")
+    import mailoney
+    controller = Controller(OpenRelayHandler(), hostname=mailoney.bind_ip, port=mailoney.bind_port)
+    controller.start()
+    try:
+        asyncio.get_event_loop().run_forever()
+    except KeyboardInterrupt:
+        print('Detected interruption, terminating...')
+        controller.stop()
 
-        honeypot = OpenRelay((mailoney.bind_ip, mailoney.bind_port), None)
-        print('[*] Mail Relay listening on {}:{}'.format(mailoney.bind_ip, mailoney.bind_port))
-        try:
-            asyncore.loop()
-        except KeyboardInterrupt:
-            print('Detected interruption, terminating...')
+if __name__ == '__main__':
     run()
