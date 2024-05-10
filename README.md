@@ -1,28 +1,50 @@
-# About
-Mailoney is a SMTP Honeypot I wrote just to have fun learning Python. There are various modules or types (see below) that provide custom modes to fit your needs. Happily accepting advise, feature or pull requests. 
+![image](https://github.com/referefref/mailoney/assets/56499429/7ffe5426-61f2-4dba-ba86-df75ec8b1a54)
+
+
+# About Mailoney-ng
+- Mailoney is a modular STMP honeypot written by [***Brandon E***](https://github.com/phin3has) in Python.
+- The original version relied upon several libraries and functions that are no longer provided by modern Python3 which required significant code refactoring to make operational.
+- There exists some bugs still with shellcode emulation which are being ironed out, and some regression testing is required to ensure no features were lost in the refactoring - particularly within the schizo_open_relay module originally written by [***@botnet_hunter***](https://twitter.com/botnet_hunter)
+- This is maintained as a fork for now due to it's significant divergence from the original
 
 # Installation
-At this time, everything should be included in a Linux python environment. Simply follow the usage instructions. 
-
-**NOTE:** To get all of the features out of the schizo module, users may wish to install the python-libemu module, but Mailoney will run with out it. 
+This has only been tested with docker
+```
+git clone https://github.com/referefref/mailoney.git
+cd mailoney
+docker compose up -d
+```
 
 # Usage
 
 ```
-usage: mailoney.py [-h] [-i <ip address>] [-p <port>] -s mailserver -t
-                   {open_relay,postfix_creds,schizo_open_relay}
+usage: mailoney.py [-h] [-i IP] [-p PORT] [-s SERVERNAME] -t {open_relay,postfix_creds,schizo_open_relay} [-logpath LOGPATH]
+                   [-hpfserver HPFSERVER] [-hpfport HPFPORT] [-hpfident HPFIDENT] [-hpfsecret HPFSECRET]
+                   [-hpfchannelprefix HPFCHANNELPREFIX]
 
-Command line arguments
+Configure the SMTP Honeypot settings
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
-  -i <ip address>       The IP address to listen on
-  -p <port>             The port to listen on
-  -s mailserver         A Name that'll show up as the mail server name
-  -t {open_relay,	Type of Honeypot 
-  	postfix_creds,
-  	schizo_open_relay}
+  -i IP, --ip IP        IP address to listen on
+  -p PORT, --port PORT  Port to listen on
+  -s SERVERNAME, --servername SERVERNAME
+                        Mail server name
+  -t {open_relay,postfix_creds,schizo_open_relay}, --type {open_relay,postfix_creds,schizo_open_relay}
+                        Type of honeypot to deploy
+  -logpath LOGPATH      Path for logging
+  -hpfserver HPFSERVER  HPFeeds server address
+  -hpfport HPFPORT      HPFeeds server port
+  -hpfident HPFIDENT    HPFeeds identifier
+  -hpfsecret HPFSECRET  HPFeeds secret
+  -hpfchannelprefix HPFCHANNELPREFIX
+                        Prefix for HPFeeds channels
 ```
+---
+---
+
+# The following are original notes from the core repo
+
 ### Types
 Right now there are three types of Modules for Mailoney. 
 - open_relay - Just a generic open relay, will attempt to log full text emails attempted to be sent. 
@@ -50,11 +72,9 @@ Then run `ufw reload` and you are all set.
 
 # ToDo 
  - [ ] Add modules for EXIM, Microsoft, others
- - [ ] Build in Error Handling
+ - [X] Build in Error Handling
  - [X] ~~Add a Daemon flag to background process.~~
  - [X] ~~Secure this by not requiring elevated perms, port forward from port 25.~~
  - [ ] Database logging
  - [ ] Possible relay for test emails. 
- - [ ] Make honeypot detection more difficult
- 	(e.g. fuzz mailoney with SMTP commands, catch exceptions, patch and profit)
-
+ - [X] ~~Make honeypot detection more difficult~~
