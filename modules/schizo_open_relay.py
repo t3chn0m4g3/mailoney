@@ -3,11 +3,9 @@ __author__ = '@botnet_hunter'
 from datetime import datetime
 import socket
 try:
-    import pylibemu as libemu
-    print("Successfully imported pylibemu.")
+    import libemu
 except ImportError:
     libemu = None
-    print("Pylibemu unavailable.")
 import sys
 import errno
 import time
