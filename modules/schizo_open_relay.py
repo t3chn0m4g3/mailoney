@@ -3,9 +3,11 @@ __author__ = '@botnet_hunter'
 from datetime import datetime
 import socket
 try:
-    import libemu
+    import pylibemu as libemu
+    print("Successfully imported pylibemu.")
 except ImportError:
     libemu = None
+    print("Pylibemu unavailable.")
 import sys
 import errno
 import time
@@ -27,13 +29,6 @@ def string_escape(s, encoding='utf-8'):
              .decode('unicode-escape') # Perform the actual octal-escaping decode
              .encode('latin1')         # 1:1 mapping back to bytes
              .decode(encoding))        # Decode original encoding
-
-# def log_to_file(file_path, ip, port, data):
-    # with output_lock:
-        # with open(file_path, "a") as f:
-            # message = "[{0}][{1}:{2}] {3}".format(time.time(), ip, port, string_escape(data))
-            # print(file_path + " " + message)
-            # f.write(message + "\n")
 
 def log_to_file(file_path, ip, port, data):
     with output_lock:
