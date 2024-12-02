@@ -150,7 +150,7 @@ class SMTPChannel(asynchat.async_chat):
             method = None
             i = line.find(' ')
             if i < 0:
-                command = line.upper()
+                command = line.upper().rstrip("\r")
                 arg = None
             else:
                 command = line[:i].upper()
