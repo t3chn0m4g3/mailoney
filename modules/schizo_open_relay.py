@@ -277,7 +277,7 @@ class SMTPChannel(asynchat.async_chat):
         if not self.__rcpttos:
             self.push(b'503 Error: need RCPT command')
             return
-        if arg:
+        if arg is not None and arg.strip():
             self.push(b'501 Syntax: DATA')
             return
         self.__state = self.DATA
