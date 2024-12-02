@@ -275,14 +275,14 @@ class SMTPChannel(asynchat.async_chat):
 
     def smtp_DATA(self, arg):
         if not self.__rcpttos:
-            self.push('503 Error: need RCPT command')
+            self.push(b'503 Error: need RCPT command')
             return
         if arg:
-            self.push('501 Syntax: DATA')
+            self.push(b'501 Syntax: DATA')
             return
         self.__state = self.DATA
-        self.set_terminator('\r\n.\r\n')
-        self.push('354 End data with <CR><LF>.<CR><LF>')
+        self.set_terminator(b'\r\n.\r\n')
+        self.push(b'354 End data with <CR><LF>.<CR><LF>')
 
 
 class SMTPServer(asyncore.dispatcher):
