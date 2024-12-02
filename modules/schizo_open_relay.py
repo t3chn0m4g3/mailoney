@@ -151,7 +151,6 @@ class SMTPChannel(asynchat.async_chat):
             i = line.find(' ')
             if i < 0:
                 command = line.upper()
-                log_to_file(mailoney.logpath+"/commands.log", self.__addr[0], self.__addr[1], command)
                 arg = None
             else:
                 command = line[:i].upper()
