@@ -20,13 +20,17 @@ sys.path.append("../")
 import mailoney
 
 output_lock = threading.RLock()
-hpc,hpfeeds_prefix = mailoney.connect_hpfeeds()
 
 def string_escape(s, encoding='utf-8'):
-    return (s.encode('latin1')         # To bytes, required by 'unicode-escape'
-             .decode('unicode-escape') # Perform the actual octal-escaping decode
-             .encode('latin1')         # 1:1 mapping back to bytes
-             .decode(encoding))        # Decode original encoding
+    try:
+        # Attempt to process the string as text
+        return (s.encode('latin1')         # To bytes, required by 'unicode-escape'
+                 .decode('unicode-escape') # Perform the actual octal-escaping decode
+                 .encode('latin1')         # 1:1 mapping back to bytes
+                 .decode(encoding))        # Decode original encoding
+    except UnicodeDecodeError:
+        # Fallback: return a hex representation of the binary data
+        return s.encode('latin1').hex()
 
 def log_to_file(file_path, ip, port, data):
     with output_lock:
@@ -40,25 +44,21 @@ def log_to_file(file_path, ip, port, data):
                     'timestamp': strftime("20%y-%m-%dT%H:%M:%S.000000Z", gmtime()), 
                     'src_ip': ip, 
                     'src_port': port,  
-                    'data': data, 
-                    'smtp_input': emails
+                    'data': data.decode() if isinstance(data, bytes) else data
                 }
+                if emails:  # Only add smtp_input if emails is not empty
+                    dictmap['emails'] = emails
+
                 # Serialize the dictionary to a JSON-formatted string
                 json_data = json.dumps(dictmap)
                 f.write(json_data + '\n')
                 # Format the message for logging
-                message = "[{0}][{1}:{2}] {3}".format(time(), ip, port, repr(data))
+                message = "[{0}][{1}:{2}] {3}".format(time.time(), ip, port, repr(data))
                 # Log the message to console
                 print(file_path + " " + message)
         except Exception as e:
             # Log the error (or pass a specific message)
             print("An error occurred while logging to file: ", str(e))
-
-def log_to_hpfeeds(channel, data):
-        if hpc:
-            message = data
-            hpfchannel=hpfeeds_prefix+"."+channel
-            hpc.publish(hpfchannel, message)
 
 def process_packet_for_shellcode(packet, ip, port):
     if libemu is None:
@@ -67,11 +67,10 @@ def process_packet_for_shellcode(packet, ip, port):
     r = emulator.test(packet)
     if r is not None:
         # we have shellcode
-        log_to_file(mailoney.logpath+"/shellcode.log", ip, port, "We have some shellcode")
-        #log_to_file(mailoney.logpath+"/shellcode.log", ip, port, emulator.emu_profile_output)
-        #log_to_hpfeeds("/shellcode", ip, port, emulator.emu_profile_output)
-        log_to_file(mailoney.logpath+"/shellcode.log", ip, port, packet)
-        log_to_hpfeeds("shellcode",  json.dumps({ "Timestamp":format(time.time()), "ServerName": self.__fqdn, "SrcIP": self.__addr[0], "SrcPort": self.__addr[1],"Shellcode" :packet}))
+        log_to_file(mailoney.logpath+"shellcode.log", ip, port, "We have some shellcode")
+        #log_to_file(mailoney.logpath+"shellcode.log", ip, port, emulator.emu_profile_output)
+        log_to_file(mailoney.logpath+"shellcode.log", ip, port, packet)
+
 
 def generate_version_date():
     now = datetime.now()
@@ -79,7 +78,7 @@ def generate_version_date():
     months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
     return "{0}, {1} {2} {3} {4}:{5}:{6}".format(week_days[now.weekday()], now.day, months[now.month - 1], now.year, str(now.hour).zfill(2), str(now.minute).zfill(2), str(now.second).zfill(2))
 
-__version__ = 'ESMTP Exim 4.69 #1 {0} -0700'.format(generate_version_date())
+__version__ = 'ESMTP Exim 4.97 {0} -0700'.format(generate_version_date())
 EMPTYSTRING = b''
 NEWLINE = b'\n'
 
@@ -118,12 +117,17 @@ class SMTPChannel(asynchat.async_chat):
 
     # Overrides base class for convenience
     def push(self, msg):
-        if type(msg) == str:
-            encoded_msg = msg.encode() 
-        elif type(msg) == bytes:
+        if isinstance(msg, str):
+            encoded_msg = msg.encode()
+        elif isinstance(msg, bytes):
             encoded_msg = msg
+        else:
+            raise TypeError("Unsupported message type for push.")
+        
+        # Ensure self.terminator is bytes
+        terminator = self.terminator if isinstance(self.terminator, bytes) else b'\r\n'
+        asynchat.async_chat.push(self, encoded_msg + terminator)
 
-        asynchat.async_chat.push(self, encoded_msg + self.terminator)
 
     # Implementation of base class abstract method
     def collect_incoming_data(self, data):
@@ -138,8 +142,7 @@ class SMTPChannel(asynchat.async_chat):
     def found_terminator(self):
 
         line = EMPTYSTRING.join(self.__line).decode()
-        log_to_file(mailoney.logpath+"/commands.log", self.__addr[0], self.__addr[1], string_escape(line))
-        log_to_hpfeeds("commands",  json.dumps({ "Timestamp":format(time.time()), "ServerName": self.__fqdn, "SrcIP": self.__addr[0], "SrcPort": self.__addr[1],"Commmand" : string_escape(line)}))
+        log_to_file(mailoney.logpath+"commands.log", self.__addr[0], self.__addr[1], string_escape(line))
 
         #print(>> DEBUGSTREAM, 'Data:', repr(line))
         self.__line = []
@@ -150,7 +153,7 @@ class SMTPChannel(asynchat.async_chat):
             method = None
             i = line.find(' ')
             if i < 0:
-                command = line.upper()
+                command = line.upper().rstrip("\r")
                 arg = None
             else:
                 command = line[:i].upper()
@@ -173,12 +176,12 @@ class SMTPChannel(asynchat.async_chat):
                     data.append(text[1:])
                 else:
                     data.append(text)
-            self.__data = NEWLINE.join(data)
+            self.__data = NEWLINE.join(item.encode('utf-8') if isinstance(item, str) else item for item in data)
             status = self.__server.process_message(self.__peer, self.__mailfrom, self.__rcpttos, self.__data)
             self.__rcpttos = []
             self.__mailfrom = None
             self.__state = self.COMMAND
-            self.set_terminator('\r\n')
+            self.set_terminator(b'\r\n')
             if not status:
                 self.push('250 Ok')
             else:
@@ -216,6 +219,7 @@ class SMTPChannel(asynchat.async_chat):
     def smtp_QUIT(self, arg):
         # args is ignored
         self.push('221 Bye')
+        self.set_terminator(b'\r\n.\r\n')
         self.close_when_done()
 
     def smtp_AUTH(self, arg):
@@ -275,14 +279,14 @@ class SMTPChannel(asynchat.async_chat):
 
     def smtp_DATA(self, arg):
         if not self.__rcpttos:
-            self.push('503 Error: need RCPT command')
+            self.push(b'503 Error: need RCPT command')
             return
         if arg:
-            self.push('501 Syntax: DATA')
+            self.push(b'501 Syntax: DATA')
             return
         self.__state = self.DATA
-        self.set_terminator('\r\n.\r\n')
-        self.push('354 End data with <CR><LF>.<CR><LF>')
+        self.set_terminator(b'\r\n.\r\n')
+        self.push(b'354 End data with <CR><LF>.<CR><LF>')
 
 
 class SMTPServer(asyncore.dispatcher):
@@ -346,22 +350,26 @@ def module():
 
         def process_message(self, peer, mailfrom, rcpttos, data, mail_options=None,rcpt_options=None):
             #setup the Log File
-            log_to_file(mailoney.logpath+"/mail.log", peer[0], peer[1], '')
-            log_to_file(mailoney.logpath+"/mail.log", peer[0], peer[1], '*' * 50)
-            log_to_file(mailoney.logpath+"/mail.log", peer[0], peer[1], 'Mail from: {0}'.format(mailfrom))
-            log_to_file(mailoney.logpath+"/mail.log", peer[0], peer[1], 'Mail to: {0}'.format(", ".join(rcpttos)))
-            log_to_file(mailoney.logpath+"/mail.log", peer[0], peer[1], 'Data:')
-            log_to_file(mailoney.logpath+"/mail.log", peer[0], peer[1], data)
+            #log_to_file(mailoney.logpath+"mail.log", peer[0], peer[1], '')
+            #log_to_file(mailoney.logpath+"mail.log", peer[0], peer[1], '*' * 50)
+            log_to_file(mailoney.logpath+"mail.log", peer[0], peer[1], 'Mail from: {0}'.format(mailfrom))
+            log_to_file(mailoney.logpath+"mail.log", peer[0], peer[1], 'Mail to: {0}'.format(", ".join(rcpttos)))
+            #log_to_file(mailoney.logpath+"mail.log", peer[0], peer[1], 'Data:')
+            try:
+                log_to_file(
+                    mailoney.logpath + "mail.log", 
+                    peer[0], 
+                    peer[1], 
+                    data.decode('utf-8')
+                )
+            except UnicodeDecodeError:
+                log_to_file(
+                    mailoney.logpath + "mail.log", 
+                    peer[0], 
+                    peer[1], 
+                    data.decode('utf-8', errors='replace')  # Replace invalid characters
+                )
 
-            loghpfeeds = {}
-            loghpfeeds['ServerName'] = mailoney.srvname
-            loghpfeeds['Timestamp'] = format(time.time())
-            loghpfeeds['SrcIP'] = peer[0]
-            loghpfeeds['SrcPort'] = peer[1]
-            loghpfeeds['MailFrom'] = mailfrom
-            loghpfeeds['MailTo'] = format(", ".join(rcpttos))
-            loghpfeeds['Data'] = data
-            log_to_hpfeeds("mail", json.dumps(loghpfeeds))
 
 
     def run():
@@ -373,3 +381,4 @@ def module():
         except KeyboardInterrupt:
             print('Detected interruption, terminating...')
     run()
+    
