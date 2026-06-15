@@ -1,0 +1,7 @@
+Add multi-architecture Docker build support
+
+* Updated GitHub Actions workflow to build for both amd64 and arm64
+* Added platform specification to docker/setup-buildx-action
+* Added platform specification to docker/build-push-action
+* This allows the Docker image to run on both x86_64 and ARM architectures
+* Fixes "no matching manifest" error when pulling on ARM devices
