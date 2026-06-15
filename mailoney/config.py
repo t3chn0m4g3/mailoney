@@ -1,75 +1,284 @@
 """
-Configuration handling for Mailoney
+Configuration handling for Mailoney.
+
+Settings are loaded with this precedence:
+
+    defaults < TOML config file < MAILONEY_* environment variables < CLI flags
+
+The CLI layer applies the final override step in ``mailoney.core``.
 """
-import os
+from __future__ import annotations
+
 import logging
-from typing import Dict, Any, Optional
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-)
+from pydantic import BaseModel, ConfigDict, Field
 
-class Settings(BaseSettings):
-    """Application settings"""
-    # Server settings
-    bind_ip: str = Field(default="0.0.0.0")
-    bind_port: int = Field(default=25)
-    server_name: str = Field(default="mail.example.com")
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised on Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
 
-    # Per-connection inactivity timeout in seconds. A client that neither
-    # sends a command nor advances the DATA body within this window is
-    # dropped, so slow-loris connections cannot pin handler threads.
-    # 0 or negative disables the timeout (not recommended).
-    conn_timeout: int = Field(default=30)
 
-    # Database settings
-    db_url: str = Field(default="sqlite:///mailoney.db")
+DEFAULT_CONFIG_FILE = "mailoney.toml"
 
-    # Filesystem storage for captured mail bodies. Unset = bodies stay
-    # inline in the session log (DB blob / event JSON). When set, bodies
-    # are written under <mail_dir>/<YYYY-MM-DD>/<src-ip>/<session>.eml
-    # and the session log carries only the relative path.
-    mail_dir: Optional[str] = Field(default=None)
 
-    # Logging settings
-    log_level: str = Field(default="INFO")
-    
-    # Configure the settings to use the MAILONEY_ prefix for environment variables
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_prefix="MAILONEY_",
-        case_sensitive=False,
-        extra="ignore"
+class ListenerConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    bind_ip: str = "0.0.0.0"
+    port: int = 25
+    name: str = "smtp"
+    starttls: bool = True
+    implicit_tls: bool = False
+
+
+def _default_listeners() -> List[ListenerConfig]:
+    return [
+        ListenerConfig(name="smtp", bind_ip="0.0.0.0", port=25, starttls=True),
+        ListenerConfig(name="submission", bind_ip="0.0.0.0", port=587, starttls=True),
+        ListenerConfig(
+            name="smtps",
+            bind_ip="0.0.0.0",
+            port=465,
+            starttls=False,
+            implicit_tls=True,
+        ),
+    ]
+
+
+class ServerConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    server_name: str = "mail01.localdomain"
+    conn_timeout: int = 30
+    max_connections: int = 100
+    max_mail_body_bytes: int = 10_485_760
+    listeners: List[ListenerConfig] = Field(default_factory=_default_listeners)
+
+
+class LoggingConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    log_file: str = "log/log.json"
+    log_level: str = "INFO"
+
+
+class StorageConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    mail_dir: str = "log/mails"
+    save_mail_bodies: bool = True
+    save_attachments: bool = True
+
+    @property
+    def extract_attachments(self) -> bool:
+        return self.save_attachments
+
+
+class TlsConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    auto_generate: bool = True
+    cert_file: str = "log/tls/server.crt"
+    key_file: str = "log/tls/server.key"
+
+
+class RateLimitConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    window_seconds: int = 3600
+    block_seconds: int = 3600
+    max_messages_per_ip: int = 100
+    max_messages_per_sender: int = 25
+    log_block_once: bool = True
+    state_file: str = "log/rate_limit_state.json"
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    tls: TlsConfig = Field(default_factory=TlsConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+
+
+ENV_MAP = {
+    "MAILONEY_BIND_IP": ("server", "bind_ip"),
+    "MAILONEY_SERVER_BIND_IP": ("server", "bind_ip"),
+    "MAILONEY_BIND_PORT": ("server", "bind_port"),
+    "MAILONEY_SERVER_BIND_PORT": ("server", "bind_port"),
+    "MAILONEY_SERVER_NAME": ("server", "server_name"),
+    "MAILONEY_CONN_TIMEOUT": ("server", "conn_timeout"),
+    "MAILONEY_SERVER_CONN_TIMEOUT": ("server", "conn_timeout"),
+    "MAILONEY_MAX_CONNECTIONS": ("server", "max_connections"),
+    "MAILONEY_SERVER_MAX_CONNECTIONS": ("server", "max_connections"),
+    "MAILONEY_MAX_MAIL_BODY_BYTES": ("server", "max_mail_body_bytes"),
+    "MAILONEY_SERVER_MAX_MAIL_BODY_BYTES": ("server", "max_mail_body_bytes"),
+    "MAILONEY_LOG_FILE": ("logging", "log_file"),
+    "MAILONEY_LOGGING_LOG_FILE": ("logging", "log_file"),
+    "MAILONEY_LOG_LEVEL": ("logging", "log_level"),
+    "MAILONEY_LOGGING_LOG_LEVEL": ("logging", "log_level"),
+    "MAILONEY_MAIL_DIR": ("storage", "mail_dir"),
+    "MAILONEY_STORAGE_MAIL_DIR": ("storage", "mail_dir"),
+    "MAILONEY_SAVE_MAIL_BODIES": ("storage", "save_mail_bodies"),
+    "MAILONEY_STORAGE_SAVE_MAIL_BODIES": ("storage", "save_mail_bodies"),
+    "MAILONEY_SAVE_ATTACHMENTS": ("storage", "save_attachments"),
+    "MAILONEY_STORAGE_SAVE_ATTACHMENTS": ("storage", "save_attachments"),
+    "MAILONEY_EXTRACT_ATTACHMENTS": ("storage", "save_attachments"),
+    "MAILONEY_STORAGE_EXTRACT_ATTACHMENTS": ("storage", "save_attachments"),
+    "MAILONEY_TLS_ENABLED": ("tls", "enabled"),
+    "MAILONEY_TLS_AUTO_GENERATE": ("tls", "auto_generate"),
+    "MAILONEY_TLS_CERT_FILE": ("tls", "cert_file"),
+    "MAILONEY_TLS_KEY_FILE": ("tls", "key_file"),
+    "MAILONEY_RATE_LIMIT_ENABLED": ("rate_limit", "enabled"),
+    "MAILONEY_RATE_LIMIT_WINDOW_SECONDS": ("rate_limit", "window_seconds"),
+    "MAILONEY_RATE_LIMIT_BLOCK_SECONDS": ("rate_limit", "block_seconds"),
+    "MAILONEY_RATE_LIMIT_MAX_MESSAGES_PER_IP": ("rate_limit", "max_messages_per_ip"),
+    "MAILONEY_RATE_LIMIT_MAX_MESSAGES_PER_SENDER": (
+        "rate_limit",
+        "max_messages_per_sender",
+    ),
+    "MAILONEY_RATE_LIMIT_LOG_BLOCK_ONCE": ("rate_limit", "log_block_once"),
+    "MAILONEY_RATE_LIMIT_STATE_FILE": ("rate_limit", "state_file"),
+}
+
+
+def _legacy_listener_from(data: Dict[str, Any]) -> Dict[str, Any]:
+    server = data.get("server", {})
+    return {
+        "name": "smtp",
+        "bind_ip": server.get("bind_ip", "0.0.0.0"),
+        "port": server.get("bind_port", 25),
+        "starttls": True,
+        "implicit_tls": False,
+    }
+
+
+def _has_legacy_listener_config(config: Dict[str, Any]) -> bool:
+    server = config.get("server")
+    return isinstance(server, dict) and (
+        "bind_ip" in server or "bind_port" in server
     )
 
-def get_settings() -> Settings:
+
+def _has_explicit_listeners(config: Dict[str, Any]) -> bool:
+    server = config.get("server")
+    return isinstance(server, dict) and "listeners" in server
+
+
+def _has_legacy_listener_env() -> bool:
+    return any(
+        env_name in os.environ
+        for env_name in (
+            "MAILONEY_BIND_IP",
+            "MAILONEY_SERVER_BIND_IP",
+            "MAILONEY_BIND_PORT",
+            "MAILONEY_SERVER_BIND_PORT",
+        )
+    )
+
+
+def _normalize_legacy_storage(config: Dict[str, Any]) -> None:
+    storage = config.get("storage")
+    if not isinstance(storage, dict):
+        return
+    if "extract_attachments" in storage and "save_attachments" not in storage:
+        storage["save_attachments"] = storage["extract_attachments"]
+
+
+def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _coerce_env_value(value: str) -> Any:
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "off"}:
+        return False
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _env_overrides() -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    for env_name, (section, field) in ENV_MAP.items():
+        if env_name not in os.environ:
+            continue
+        overrides.setdefault(section, {})[field] = _coerce_env_value(
+            os.environ[env_name]
+        )
+    return overrides
+
+
+def load_toml_config(config_file: Optional[str]) -> Dict[str, Any]:
+    if not config_file:
+        return {}
+
+    path = Path(config_file)
+    if not path.exists():
+        return {}
+
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid config file: {config_file}")
+    return data
+
+
+def get_settings(config_file: Optional[str] = None) -> Settings:
     """
-    Get application settings
-    
-    Returns:
-        Settings object
+    Load settings from defaults, TOML, and environment variables.
     """
-    return Settings()
+    selected_config = (
+        config_file
+        if config_file is not None
+        else os.environ.get("MAILONEY_CONFIG", DEFAULT_CONFIG_FILE)
+    )
+
+    toml_config = load_toml_config(selected_config)
+    _normalize_legacy_storage(toml_config)
+    env_config = _env_overrides()
+    explicit_listeners = _has_explicit_listeners(toml_config)
+    legacy_listener = not explicit_listeners and (
+        _has_legacy_listener_config(toml_config) or _has_legacy_listener_env()
+    )
+
+    data = Settings().model_dump()
+    _deep_update(data, toml_config)
+    _deep_update(data, env_config)
+    if legacy_listener:
+        data.setdefault("server", {})["listeners"] = [_legacy_listener_from(data)]
+    return Settings.model_validate(data)
+
 
 def configure_logging(level: Optional[str] = None) -> None:
     """
-    Configure application logging
-    
-    Args:
-        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    Configure process logging for operational messages.
     """
     if level is None:
-        level = get_settings().log_level
-        
+        level = get_settings().logging.log_level
+
     numeric_level = getattr(logging, level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {level}")
-    
+
     logging.basicConfig(
         level=numeric_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
     )

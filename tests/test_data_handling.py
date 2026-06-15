@@ -1,193 +1,190 @@
 """
-Tests for the SMTP DATA-phase implementation:
-
-  * the chunked body reader (`SMTPHoneypot._receive_mail_body`)
-  * the filesystem storage helper (`mail_storage.store_mail_body`)
+Tests for DATA reading and mail/attachment storage.
 """
 import os
-import socket
 from pathlib import Path
 
-import pytest
-
-from mailoney.core import (
-    MAX_MAIL_BODY_BYTES,
-    SMTPHoneypot,
-)
+from mailoney.core import SMTPLineReader
 from mailoney import mail_storage
 
 
-def _make_recv(*chunks: bytes):
-    """Build a recv-shaped callable that yields the given chunks in order.
+class FakeSocket:
+    def __init__(self, *chunks: bytes):
+        self.chunks = list(chunks)
 
-    Honours the buffer-size contract: if a scripted chunk is larger than
-    the requested size, returns the head and queues the tail for the next
-    call.
-    """
-    queue = list(chunks)
-
-    def _recv(size: int) -> bytes:
-        if not queue:
+    def recv(self, size: int) -> bytes:
+        if not self.chunks:
             return b""
-        chunk = queue.pop(0)
+        chunk = self.chunks.pop(0)
         if len(chunk) <= size:
             return chunk
-        queue.insert(0, chunk[size:])
+        self.chunks.insert(0, chunk[size:])
         return chunk[:size]
 
-    return _recv
 
-
-def _make_recv_then_timeout(*chunks: bytes):
-    """A recv-shaped callable that yields the given chunks, then raises
-    ``socket.timeout`` — simulating a client that stalls mid-body once the
-    socket has an inactivity timeout set.
-    """
-    queue = list(chunks)
-
-    def _recv(size: int) -> bytes:
-        if queue:
-            return queue.pop(0)
-        raise socket.timeout()
-
-    return _recv
-
-
-@pytest.fixture
-def honeypot():
-    return SMTPHoneypot(bind_ip="127.0.0.1", bind_port=8025)
-
-
-def test_receive_body_single_chunk(honeypot):
-    body, found = honeypot._receive_mail_body(
-        _make_recv(b"Subject: hi\r\n\r\nHello world\r\n.\r\n")
+def test_read_data_single_chunk():
+    reader = SMTPLineReader(
+        FakeSocket(b"Subject: hi\r\n\r\nHello world\r\n.\r\n")
     )
+    body, found = reader.read_data(1024)
     assert found is True
     assert body == b"Subject: hi\r\n\r\nHello world"
 
 
-def test_receive_body_multiple_chunks(honeypot):
-    """The reader must reassemble across recv() boundaries."""
-    body, found = honeypot._receive_mail_body(
-        _make_recv(
-            b"Subject: split\r\n\r\nFirst half ",
-            b"second half\r\n.\r\n",
-        )
-    )
-    assert found is True
-    assert body == b"Subject: split\r\n\r\nFirst half second half"
-
-
-def test_receive_body_terminator_split_across_boundary(honeypot):
-    """`\\r\\n.\\r\\n` arriving in two recv() calls is still detected."""
-    body, found = honeypot._receive_mail_body(
-        _make_recv(
-            b"hello world\r\n",
-            b".\r\n",
-        )
-    )
+def test_read_data_terminator_split_across_boundary():
+    reader = SMTPLineReader(FakeSocket(b"hello world\r\n", b".\r\n"))
+    body, found = reader.read_data(1024)
     assert found is True
     assert body == b"hello world"
 
 
-def test_receive_body_permissive_terminator(honeypot):
-    """`\\n.\\n` (LF-only) is also recognised."""
-    body, found = honeypot._receive_mail_body(
-        _make_recv(b"loose body\n.\n")
-    )
+def test_read_data_preserves_pipelined_remainder():
+    reader = SMTPLineReader(FakeSocket(b"body\r\n.\r\nQUIT\r\n"))
+    body, found = reader.read_data(1024)
     assert found is True
-    assert body == b"loose body"
+    assert body == b"body"
+    assert reader.readline() == b"QUIT"
 
 
-def test_receive_body_empty(honeypot):
-    """A body that's just the terminator (empty message) returns empty bytes."""
-    body, found = honeypot._receive_mail_body(_make_recv(b".\r\n"))
-    assert found is True
-    assert body == b""
-
-
-def test_receive_body_peer_close_without_terminator(honeypot):
-    """Peer disconnects mid-body — return what we have, found=False."""
-    body, found = honeypot._receive_mail_body(_make_recv(b"truncated"))
+def test_read_data_size_cap_truncates():
+    reader = SMTPLineReader(FakeSocket(b"x" * 100))
+    body, found = reader.read_data(10)
     assert found is False
-    assert body == b"truncated"
+    assert body == b"x" * 10
 
 
-def test_receive_body_size_cap_truncates(honeypot):
-    """At the cap, recv loop stops, found=False, body is exactly cap-sized."""
-    payload = b"x" * 200_000  # > a recv buffer, < the cap
-    body, found = honeypot._receive_mail_body(
-        _make_recv(payload * 10),  # 2 MB total — exceeds 1 MB cap
-        max_bytes=500_000,
+def test_store_mail_message_writes_eml_with_expected_layout(tmp_path):
+    rel = mail_storage.store_mail_message(
+        str(tmp_path),
+        "192.0.2.1",
+        "session-id",
+        "message-id",
+        b"Subject: hi\r\nFrom: a@example.test\r\nTo: b@example.test\r\n\r\nBody",
     )
-    assert found is False
-    assert len(body) == 500_000
 
-
-def test_receive_body_command_like_content_is_not_interpreted(honeypot):
-    """Bytes inside the body that look like SMTP commands stay opaque."""
-    body, found = honeypot._receive_mail_body(
-        _make_recv(b"This body contains QUIT and EHLO foo\r\n.\r\n")
-    )
-    assert found is True
-    assert b"QUIT" in body
-    assert b"EHLO" in body
-
-
-def test_receive_body_recv_timeout_truncates(honeypot):
-    """A recv() timeout mid-body yields a truncated result, not a hang.
-
-    Without this the handler thread blocks forever on a stalled client.
-    """
-    body, found = honeypot._receive_mail_body(
-        _make_recv_then_timeout(b"partial body before the client stalled")
-    )
-    assert found is False
-    assert body == b"partial body before the client stalled"
-
-
-# --- mail_storage --------------------------------------------------------
-
-
-def test_store_mail_body_writes_file_with_expected_layout(tmp_path):
-    rel = mail_storage.store_mail_body(
-        str(tmp_path), "192.0.2.1", "abc-123", b"hello body\r\n",
-    )
-    abs_path = tmp_path / rel
+    abs_path = tmp_path / rel["eml_file"]
     assert abs_path.exists()
-    assert abs_path.read_bytes() == b"hello body\r\n"
-    # YYYY-MM-DD / src-ip / uuid.eml
-    parts = Path(rel).parts
-    assert len(parts) == 3
+    assert abs_path.read_bytes().startswith(b"Subject: hi")
+    parts = Path(rel["eml_file"]).parts
+    assert len(parts) == 4
     assert parts[1] == "192.0.2.1"
-    assert parts[2] == "abc-123.eml"
+    assert parts[2] == "session-id"
+    assert parts[3] == "message-id.eml"
+    assert rel["subject"] == "hi"
+    assert rel["header_from"] == "a@example.test"
+    assert rel["header_to"] == "b@example.test"
 
 
-def test_store_mail_body_preserves_ipv6_colons(tmp_path):
-    rel = mail_storage.store_mail_body(
-        str(tmp_path), "2001:db8::1", "uuid-x", b"x",
+def test_store_mail_message_preserves_ipv6_colons(tmp_path):
+    rel = mail_storage.store_mail_message(
+        str(tmp_path),
+        "2001:db8::1",
+        "session",
+        "message",
+        b"Subject: x\r\n\r\nx",
     )
-    parts = Path(rel).parts
+    parts = Path(rel["eml_file"]).parts
     assert parts[1] == "2001:db8::1"
-    assert (tmp_path / rel).exists()
+    assert (tmp_path / rel["eml_file"]).exists()
 
 
-def test_store_mail_body_strips_unsafe_characters(tmp_path):
-    """Garbage in the IP gets dropped, but a path is still produced."""
-    rel = mail_storage.store_mail_body(
-        str(tmp_path), "../../../etc/passwd", "uuid-y", b"bytes",
+def test_store_mail_message_strips_unsafe_ip_characters(tmp_path):
+    rel = mail_storage.store_mail_message(
+        str(tmp_path),
+        "../../../etc/passwd",
+        "session",
+        "message",
+        b"Subject: x\r\n\r\nx",
     )
-    parts = Path(rel).parts
-    # No path traversal should survive.
+    parts = Path(rel["eml_file"]).parts
     assert ".." not in parts
     assert "etc" not in parts
-    assert (tmp_path / rel).exists()
+    assert (tmp_path / rel["eml_file"]).exists()
 
 
-def test_store_mail_body_sets_restrictive_mode(tmp_path):
-    rel = mail_storage.store_mail_body(
-        str(tmp_path), "10.0.0.1", "uuid-z", b"x",
+def test_store_mail_message_sets_restrictive_mode(tmp_path):
+    rel = mail_storage.store_mail_message(
+        str(tmp_path), "10.0.0.1", "session", "message", b"Subject: x\r\n\r\nx"
     )
-    abs_path = tmp_path / rel
-    mode = os.stat(abs_path).st_mode & 0o777
+    mode = os.stat(tmp_path / rel["eml_file"]).st_mode & 0o777
     assert mode == 0o640
+
+
+def test_store_mail_message_extracts_attachments(tmp_path):
+    raw = (
+        b"From: a@example.test\r\n"
+        b"To: b@example.test\r\n"
+        b"Subject: with attachment\r\n"
+        b"Content-Type: multipart/mixed; boundary=frontier\r\n"
+        b"\r\n"
+        b"--frontier\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"Body\r\n"
+        b"--frontier\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Disposition: attachment; filename=\"note.txt\"\r\n"
+        b"Content-Transfer-Encoding: base64\r\n"
+        b"\r\n"
+        b"aGVsbG8=\r\n"
+        b"--frontier--\r\n"
+    )
+
+    rel = mail_storage.store_mail_message(
+        str(tmp_path), "192.0.2.1", "session", "message", raw
+    )
+
+    assert len(rel["attachments"]) == 1
+    attachment = rel["attachments"][0]
+    assert attachment["filename"] == "note.txt"
+    assert attachment["content_type"] == "text/plain"
+    assert attachment["size"] == 5
+    assert (tmp_path / attachment["path"]).read_bytes() == b"hello"
+
+
+def test_store_mail_message_can_skip_eml_write(tmp_path):
+    rel = mail_storage.store_mail_message(
+        str(tmp_path),
+        "192.0.2.1",
+        "session-id",
+        "message-id",
+        b"Subject: hi\r\nFrom: a@example.test\r\nTo: b@example.test\r\n\r\nBody",
+        save_mail_body=False,
+        save_attachments=False,
+    )
+
+    assert "eml_file" not in rel
+    assert "eml_size" not in rel
+    assert rel["subject"] == "hi"
+    assert rel["header_from"] == "a@example.test"
+    assert rel["header_to"] == "b@example.test"
+    assert not list(tmp_path.glob("**/*.eml"))
+
+
+def test_store_mail_message_can_skip_attachment_write(tmp_path):
+    raw = (
+        b"Subject: with attachment\r\n"
+        b"Content-Type: multipart/mixed; boundary=frontier\r\n"
+        b"\r\n"
+        b"--frontier\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"Body\r\n"
+        b"--frontier\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Disposition: attachment; filename=\"note.txt\"\r\n"
+        b"\r\n"
+        b"hello\r\n"
+        b"--frontier--\r\n"
+    )
+
+    rel = mail_storage.store_mail_message(
+        str(tmp_path),
+        "192.0.2.1",
+        "session-id",
+        "message-id",
+        raw,
+        save_attachments=False,
+    )
+
+    assert rel["attachments"] == []
+    assert (tmp_path / rel["eml_file"]).exists()
+    assert not list(tmp_path.glob("**/attachments/*"))

@@ -1,31 +1,13 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environment
+.pytest_cache/
 venv/
+.venv/
 env/
 ENV/
 
 # IDE
+.devcontainer/
 .idea/
 .vscode/
 *.swp
@@ -34,13 +16,8 @@ ENV/
 # Distribution
 dist/
 
-# Database
-*.db
-*.sqlite3
-
 # Logs
-logs/
-*.log
+log/
 
 # Environment variables
 .env
@@ -50,7 +27,3 @@ logs/
 
 # Docker
 .docker/
-
-# Claude Code
-.claude/
-CLAUDE*.md

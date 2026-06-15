@@ -2,31 +2,18 @@ services:
   mailoney:
     build: .
     restart: unless-stopped
+    user: "${MAILONEY_UID:-1000}:${MAILONEY_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
     ports:
       - "25:25"
-    environment:
-      - MAILONEY_BIND_IP=0.0.0.0
-      - MAILONEY_BIND_PORT=25
-      - MAILONEY_SERVER_NAME=mail.example.com
-      - MAILONEY_LOG_LEVEL=INFO
-      - MAILONEY_DB_URL=postgresql://postgres:postgres@db:5432/mailoney
-    depends_on:
-      - db
-    
-  db:
-    image: postgres:15
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=mailoney
+      - "465:465"
+      - "587:587"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  postgres_data:
+    #  - ./mailoney.toml:/app/mailoney.toml:ro
+      - ./log:/app/log
