@@ -1,18 +1,28 @@
-FROM ubuntu
+FROM python:3.14-alpine
 
-RUN apt update && apt install -y python3 python3-pip
+WORKDIR /app
 
-RUN mkdir -p /opt/mailoney
-COPY . /opt/mailoney
+# Python runtime defaults only. Application settings should come from
+# mailoney.toml, docker-compose.yml, or explicit runtime environment variables.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-WORKDIR /opt/mailoney
+# Copy application code and install the package
+COPY pyproject.toml README.md LICENSE mailoney.toml ./
+COPY mailoney ./mailoney
+COPY main.py ./main.py
+RUN pip install --no-cache-dir .
 
-RUN /usr/bin/pip3 install -r requirements.txt
+# Run as non-root user for better security
+RUN addgroup -S mailoney && \
+    adduser -S -G mailoney mailoney && \
+    mkdir -p /app/log && \
+    chown -R mailoney:mailoney /app
 
-RUN mkdir -p /var/log/mailoney
-RUN touch /var/log/mailoney/commands.log
+USER mailoney
 
+# Expose SMTP, SMTPS, and Submission
+EXPOSE 25 465 587
 
-VOLUME /var/log/mailoney
-
-ENTRYPOINT ["/usr/bin/python3","mailoney.py","-i","0.0.0.0","-p","25","-t", "schizo_open_relay", "-logpath", "/var/log/mailoney", "-s","mailrelay.local"]
+# Run the application
+ENTRYPOINT ["python", "main.py"]

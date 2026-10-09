@@ -1,11 +1,19 @@
-version: "3"
 services:
   mailoney:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
+    build: .
+    restart: unless-stopped
+    user: "${MAILONEY_UID:-1000}:${MAILONEY_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
     ports:
-      - "2525:25"
+      - "25:25"
+      - "465:465"
+      - "587:587"
     volumes:
-      - ./mailoney_logs:/var/log/mailoney
+    #  - ./mailoney.toml:/app/mailoney.toml:ro
+      - ./log:/app/log

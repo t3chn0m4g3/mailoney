@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mailoney"
+version = "3.0.0"
+authors = [
+    { name = "phin3has", email = "phin3has@protonmail.com" }
+]
+description = "A Simple SMTP Honeypot with JSON logging"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "cryptography>=43.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/phin3has/mailoney"
+"Bug Tracker" = "https://github.com/phin3has/mailoney/issues"
+
+[project.scripts]
+mailoney = "mailoney:run_server"
+
+[tool.pytest.ini_options]
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
