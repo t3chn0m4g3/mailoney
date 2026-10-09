@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import mailoney.core as core
 from mailoney.config import RateLimitConfig, TlsConfig
 from mailoney.core import DEFAULT_CONN_TIMEOUT, SMTPHoneypot, _format_banner
 from mailoney.rate_limiter import RateLimiter
@@ -140,6 +141,8 @@ def test_idle_connection_times_out(tmp_path):
     events = read_jsonl(tmp_path / "log" / "log.json")
     assert events[0]["event.type"] == "session"
     assert "timed out" in events[0]["errors"][0]
+    assert events[0]["session_outcome"] == "timeout"
+    assert events[0]["session_last_response_code"] == 421
 
 
 def test_pipelined_mail_session_writes_flat_mail_event(tmp_path):
@@ -186,7 +189,31 @@ def test_pipelined_mail_session_writes_flat_mail_event(tmp_path):
     assert event["tls.used"] is False
     assert "Body text" not in event["smtp_input"]
     assert "MAIL FROM:<alice@example.test>" in event["smtp_input"]
+    assert event["smtp_input_count"] == 5
+    assert event["smtp_input_truncated"] is False
+    assert event["session_outcome"] == "ok"
+    assert event["session_last_response_code"] == 221
     assert (tmp_path / "log" / "mails" / event["mail.eml_file"]).exists()
+
+
+def test_smtp_input_is_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "MAX_LOGGED_INPUT_LINES", 5)
+    honeypot = _honeypot(tmp_path)
+
+    def script(client_sock):
+        assert client_sock.recv(1024).startswith(b"220 ")
+        client_sock.sendall(b"NOOP\r\n" * 20 + b"QUIT\r\n")
+        assert b"221" in _recv_until(client_sock, b"221")
+
+    _run_session(honeypot, script)
+
+    event = read_jsonl(tmp_path / "log" / "log.json")[0]
+    assert event["event.type"] == "session"
+    assert event["smtp_input"].splitlines() == ["NOOP"] * 5
+    assert event["smtp_input_count"] == 21
+    assert event["smtp_input_truncated"] is True
+    assert event["session_outcome"] == "ok"
+    assert event["session_last_response_code"] == 221
 
 
 def test_auth_plain_splits_username_and_password(tmp_path):
@@ -279,6 +306,62 @@ def test_starttls_upgrades_session_and_logs_tls_fields(tmp_path):
     assert "STARTTLS" in event["smtp_input"]
 
 
+def test_starttls_handshake_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "TLS_HANDSHAKE_TIMEOUT_SECONDS", 0.5)
+    server_context, material = _tls_context(tmp_path)
+    honeypot = _honeypot(
+        tmp_path,
+        conn_timeout=30,
+        advertise_starttls=True,
+        tls_context=server_context,
+        tls_cert_file=material.cert_file,
+    )
+
+    def script(client_sock):
+        assert client_sock.recv(1024).startswith(b"220 ")
+        client_sock.sendall(b"EHLO plain-client\r\nSTARTTLS\r\n")
+        assert b"220 2.0.0" in _recv_until(client_sock, b"220 2.0.0")
+        # Never start the handshake; the server must give up on its own.
+        client_sock.settimeout(3)
+        assert client_sock.recv(1024) == b""
+
+    _run_session(honeypot, script)
+
+    event = read_jsonl(tmp_path / "log" / "log.json")[0]
+    assert event["session_outcome"] == "tls_failed"
+    assert "STARTTLS handshake failed" in event["errors"][0]
+    assert event["tls.used"] is False
+
+
+def test_starttls_restores_conn_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "TLS_HANDSHAKE_TIMEOUT_SECONDS", 5)
+    server_context, material = _tls_context(tmp_path)
+    honeypot = _honeypot(
+        tmp_path,
+        conn_timeout=1,
+        advertise_starttls=True,
+        tls_context=server_context,
+        tls_cert_file=material.cert_file,
+    )
+
+    def script(client_sock):
+        assert client_sock.recv(1024).startswith(b"220 ")
+        client_sock.sendall(b"EHLO plain-client\r\nSTARTTLS\r\n")
+        assert b"220 2.0.0" in _recv_until(client_sock, b"220 2.0.0")
+        tls_sock = _client_tls_context().wrap_socket(
+            client_sock,
+            server_hostname="test.example.com",
+        )
+        # Stay idle after the upgrade; conn_timeout must apply again.
+        assert b"421" in _recv_until(tls_sock, b"421", timeout=3)
+
+    _run_session(honeypot, script)
+
+    event = read_jsonl(tmp_path / "log" / "log.json")[0]
+    assert event["session_outcome"] == "timeout"
+    assert event["tls.used"] is True
+
+
 def test_implicit_tls_session_logs_tls_fields(tmp_path):
     server_context, material = _tls_context(tmp_path)
     honeypot = _honeypot(
@@ -344,6 +427,32 @@ def test_implicit_tls_plain_client_is_closed_without_thread_exception(tmp_path):
         client_sock.close()
 
 
+def test_implicit_tls_handshake_times_out_without_conn_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "TLS_HANDSHAKE_TIMEOUT_SECONDS", 0.3)
+    server_context, material = _tls_context(tmp_path)
+    honeypot = _honeypot(
+        tmp_path,
+        bind_port=8465,
+        listener_name="smtps",
+        implicit_tls=True,
+        tls_context=server_context,
+        tls_cert_file=material.cert_file,
+        conn_timeout=0,
+        max_connections=0,
+    )
+    server_sock, client_sock = socket.socketpair()
+    handler = threading.Thread(
+        target=honeypot._handle_client_with_slot_release,
+        args=(server_sock, ("203.0.113.9", 54324)),
+    )
+    handler.start()
+    try:
+        handler.join(timeout=2)
+        assert not handler.is_alive(), "handler thread did not exit"
+    finally:
+        client_sock.close()
+
+
 def test_rate_limit_blocks_and_logs_once_without_eml(tmp_path):
     config = RateLimitConfig(
         enabled=True,
@@ -373,6 +482,7 @@ def test_rate_limit_blocks_and_logs_once_without_eml(tmp_path):
     assert len(events) == 1
     event = events[0]
     assert event["event.type"] == "rate_limit_block"
+    assert event["session_outcome"] == "rate_limited"
     assert event["rate_limit.scope"] == "ip"
     assert event["rate_limit.key"] == "203.0.113.7"
     assert not list((tmp_path / "log" / "mails").glob("**/*.eml"))

@@ -137,7 +137,7 @@ state_file = "log/rate_limit_state.json"
 | Setting | Meaning |
 | --- | --- |
 | `server_name` | SMTP banner name and TLS certificate CN/SAN. The default `mail01.localdomain` looks like a small internal Linux mail host; avoid product names and container hostnames. |
-| `conn_timeout` | Per-connection inactivity timeout in seconds. `0` disables it. |
+| `conn_timeout` | Per-connection inactivity timeout in seconds. `0` disables it. TLS handshakes are limited to 10 seconds, or `conn_timeout` if lower. |
 | `max_connections` | Maximum concurrent client handlers per listener. |
 | `max_mail_body_bytes` | Maximum bytes accepted in SMTP `DATA`. Also advertised as SMTP `SIZE`. |
 
@@ -261,7 +261,12 @@ Every event includes session context such as:
 - `server_name`
 - `listener.name`, `listener.port`, `listener.tls_mode`
 - `tls.used` and TLS details when TLS was negotiated
-- `smtp_input`, containing SMTP commands line by line without DATA body content
+- `smtp_input`, containing SMTP commands line by line without DATA body content,
+  capped at the first 200 lines
+- `smtp_input_count` (all lines read, including those past the cap) and
+  `smtp_input_truncated`
+- `session_outcome`: `ok`, `timeout`, `tls_failed`, `rate_limited`, or `error`
+- `session_last_response_code`, the last SMTP reply code sent to the client
 
 Mail events add flat `mail.*` fields such as envelope sender, recipients,
 headers, subject, sending mailserver, stored `.eml` path, and truncation status.

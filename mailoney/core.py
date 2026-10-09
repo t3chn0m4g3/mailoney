@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONN_TIMEOUT = 30
 DEFAULT_MAX_MAIL_BODY_BYTES = 10_485_760
 MAX_COMMAND_LINE_BYTES = 16_384
+# Cap on SMTP input lines carried in each event. Commands such as NOOP or
+# RSET reset the error counter, so without a cap a client could grow the
+# transcript (and every JSON line that repeats it) without bound.
+MAX_LOGGED_INPUT_LINES = 200
+# Upper bound in seconds for a TLS handshake (STARTTLS and implicit TLS), so
+# a peer that never completes it cannot pin a handler thread. A smaller
+# conn_timeout takes precedence.
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 _DATA_TERMINATOR_RE = re.compile(rb"(?:\r?\n|\A)\.\r?\n")
 _DATA_TERMINATOR_TAIL = 4
@@ -159,6 +167,33 @@ class SMTPLineReader:
                 return current[: match.start()], True
 
         return bytes(body), False
+
+
+class SessionTranscript:
+    """
+    Per-session record of SMTP input lines, the last reply code and the
+    session outcome.
+    """
+
+    def __init__(self) -> None:
+        self.lines: List[str] = []
+        self.count = 0
+        self.truncated = False
+        self.last_response_code: Optional[int] = None
+        self.outcome = "ok"
+
+    def record_input(self, line: str) -> None:
+        self.count += 1
+        if len(self.lines) < MAX_LOGGED_INPUT_LINES:
+            self.lines.append(line)
+        else:
+            self.truncated = True
+
+    def record_response(self, response: str) -> None:
+        try:
+            self.last_response_code = int(response[:3])
+        except ValueError:
+            pass
 
 
 class SMTPHoneypot:
@@ -310,8 +345,6 @@ class SMTPHoneypot:
         self, client_socket: socket.socket, addr: Tuple[Any, ...]
     ) -> None:
         try:
-            if self.conn_timeout and self.conn_timeout > 0:
-                client_socket.settimeout(self.conn_timeout)
             if self.implicit_tls:
                 if self.tls_context is None:
                     logger.error(
@@ -322,10 +355,12 @@ class SMTPHoneypot:
                     client_socket.close()
                     return
                 try:
+                    client_socket.settimeout(self._handshake_timeout())
                     client_socket = self.tls_context.wrap_socket(
                         client_socket,
                         server_side=True,
                     )
+                    client_socket.settimeout(self._idle_timeout())
                 except (ssl.SSLError, OSError) as exc:
                     logger.info(
                         "Implicit TLS handshake failed from %s:%s: %s",
@@ -340,6 +375,19 @@ class SMTPHoneypot:
             if self._connection_slots:
                 self._connection_slots.release()
 
+    def _idle_timeout(self) -> Optional[float]:
+        """Socket timeout for the SMTP dialogue; None disables it."""
+        if self.conn_timeout and self.conn_timeout > 0:
+            return self.conn_timeout
+        return None
+
+    def _handshake_timeout(self) -> float:
+        """TLS handshake timeout; never looser than the idle timeout."""
+        idle = self._idle_timeout()
+        if idle is None:
+            return TLS_HANDSHAKE_TIMEOUT_SECONDS
+        return min(TLS_HANDSHAKE_TIMEOUT_SECONDS, idle)
+
     def _destination_from_socket(self, client_socket: socket.socket) -> Tuple[str, int]:
         try:
             dest = client_socket.getsockname()
@@ -347,8 +395,14 @@ class SMTPHoneypot:
         except Exception:
             return self.bind_ip, self.bind_port
 
-    def _send(self, client_socket: socket.socket, response: str) -> None:
+    def _send(
+        self,
+        client_socket: socket.socket,
+        response: str,
+        transcript: SessionTranscript,
+    ) -> None:
         client_socket.sendall(response.encode("ascii", errors="replace"))
+        transcript.record_response(response)
 
     def _tls_event_fields(
         self,
@@ -371,13 +425,13 @@ class SMTPHoneypot:
     def _read_client_line(
         self,
         reader: SMTPLineReader,
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
     ) -> Optional[str]:
         raw = reader.readline()
         if raw is None:
             return None
         line = _decode_line(raw)
-        smtp_input_lines.append(line)
+        transcript.record_input(line)
         logger.debug("Client: %s", line)
         return line
 
@@ -393,7 +447,7 @@ class SMTPHoneypot:
         dest_port: int,
         session_start: datetime,
         session_end: datetime,
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
         errors: List[str],
         tls_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -414,7 +468,11 @@ class SMTPHoneypot:
             "listener.name": self.listener_name,
             "listener.port": self.bind_port,
             "listener.tls_mode": self.listener_tls_mode,
-            "smtp_input": "\n".join(smtp_input_lines),
+            "smtp_input": "\n".join(transcript.lines),
+            "smtp_input_count": transcript.count,
+            "smtp_input_truncated": transcript.truncated,
+            "session_outcome": transcript.outcome,
+            "session_last_response_code": transcript.last_response_code,
         }
         if tls_info:
             event.update(tls_info)
@@ -432,7 +490,7 @@ class SMTPHoneypot:
         dest_ip: str,
         dest_port: int,
         session_start: datetime,
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
         errors: List[str],
         tls_info: Optional[Dict[str, Any]],
     ) -> None:
@@ -450,7 +508,7 @@ class SMTPHoneypot:
             dest_port=dest_port,
             session_start=session_start,
             session_end=now,
-            smtp_input_lines=smtp_input_lines,
+            transcript=transcript,
             errors=errors,
             tls_info=tls_info,
         )
@@ -478,13 +536,14 @@ class SMTPHoneypot:
         dest_ip: str,
         dest_port: int,
         session_start: datetime,
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
         errors: List[str],
         tls_info: Optional[Dict[str, Any]],
     ) -> bool:
         if decision.allowed:
             return False
 
+        transcript.outcome = "rate_limited"
         self._write_rate_limit_event(
             decision,
             session_id=session_id,
@@ -493,11 +552,11 @@ class SMTPHoneypot:
             dest_ip=dest_ip,
             dest_port=dest_port,
             session_start=session_start,
-            smtp_input_lines=smtp_input_lines,
+            transcript=transcript,
             errors=errors,
             tls_info=tls_info,
         )
-        self._send(client_socket, "421 4.7.0 Rate limit exceeded\r\n")
+        self._send(client_socket, "421 4.7.0 Rate limit exceeded\r\n", transcript)
         return True
 
     def _store_and_describe_mail(
@@ -524,17 +583,21 @@ class SMTPHoneypot:
         reader: SMTPLineReader,
         raw_line: str,
         auth_events: List[Dict[str, Any]],
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
     ) -> bool:
         parts = raw_line.split(None, 2)
         auth_value: Optional[str] = parts[2] if len(parts) >= 3 else None
         if auth_value is None:
-            self._send(client_socket, "334 \r\n")
-            auth_value = self._read_client_line(reader, smtp_input_lines)
+            self._send(client_socket, "334 \r\n", transcript)
+            auth_value = self._read_client_line(reader, transcript)
             if auth_value is None:
                 return False
             if auth_value == "*":
-                self._send(client_socket, "501 5.7.0 Authentication cancelled\r\n")
+                self._send(
+                    client_socket,
+                    "501 5.7.0 Authentication cancelled\r\n",
+                    transcript,
+                )
                 return True
 
         decoded = _decode_auth_plain(auth_value)
@@ -548,7 +611,7 @@ class SMTPHoneypot:
                 "decode_error": decoded["decode_error"],
             }
         )
-        self._send(client_socket, "235 2.7.0 Authentication successful\r\n")
+        self._send(client_socket, "235 2.7.0 Authentication successful\r\n", transcript)
         return True
 
     def _handle_auth_login(
@@ -557,26 +620,34 @@ class SMTPHoneypot:
         reader: SMTPLineReader,
         raw_line: str,
         auth_events: List[Dict[str, Any]],
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
     ) -> bool:
         parts = raw_line.split(None, 2)
         username_b64: Optional[str] = parts[2] if len(parts) >= 3 else None
         if username_b64 is None:
-            self._send(client_socket, "334 VXNlcm5hbWU6\r\n")
-            username_b64 = self._read_client_line(reader, smtp_input_lines)
+            self._send(client_socket, "334 VXNlcm5hbWU6\r\n", transcript)
+            username_b64 = self._read_client_line(reader, transcript)
             if username_b64 is None:
                 return False
 
         if username_b64 == "*":
-            self._send(client_socket, "501 5.7.0 Authentication cancelled\r\n")
+            self._send(
+                client_socket,
+                "501 5.7.0 Authentication cancelled\r\n",
+                transcript,
+            )
             return True
 
-        self._send(client_socket, "334 UGFzc3dvcmQ6\r\n")
-        password_b64 = self._read_client_line(reader, smtp_input_lines)
+        self._send(client_socket, "334 UGFzc3dvcmQ6\r\n", transcript)
+        password_b64 = self._read_client_line(reader, transcript)
         if password_b64 is None:
             return False
         if password_b64 == "*":
-            self._send(client_socket, "501 5.7.0 Authentication cancelled\r\n")
+            self._send(
+                client_socket,
+                "501 5.7.0 Authentication cancelled\r\n",
+                transcript,
+            )
             return True
 
         decoded = _decode_auth_login(username_b64, password_b64)
@@ -590,7 +661,7 @@ class SMTPHoneypot:
                 "decode_error": decoded["decode_error"],
             }
         )
-        self._send(client_socket, "235 2.7.0 Authentication successful\r\n")
+        self._send(client_socket, "235 2.7.0 Authentication successful\r\n", transcript)
         return True
 
     def _emit_final_events(
@@ -603,7 +674,7 @@ class SMTPHoneypot:
         dest_port: int,
         session_start: datetime,
         session_end: datetime,
-        smtp_input_lines: List[str],
+        transcript: SessionTranscript,
         auth_events: List[Dict[str, Any]],
         mail_events: List[Dict[str, Any]],
         errors: List[str],
@@ -620,7 +691,7 @@ class SMTPHoneypot:
                 dest_port=dest_port,
                 session_start=session_start,
                 session_end=session_end,
-                smtp_input_lines=smtp_input_lines,
+                transcript=transcript,
                 errors=errors,
                 tls_info=tls_info,
             )
@@ -649,7 +720,7 @@ class SMTPHoneypot:
                 dest_port=dest_port,
                 session_start=session_start,
                 session_end=session_end,
-                smtp_input_lines=smtp_input_lines,
+                transcript=transcript,
                 errors=errors,
                 tls_info=tls_info,
             )
@@ -675,7 +746,7 @@ class SMTPHoneypot:
                 dest_port=dest_port,
                 session_start=session_start,
                 session_end=session_end,
-                smtp_input_lines=smtp_input_lines,
+                transcript=transcript,
                 errors=errors,
                 tls_info=tls_info,
             )
@@ -688,7 +759,7 @@ class SMTPHoneypot:
         src_ip = str(addr[0])
         src_port = int(addr[1])
         dest_ip, dest_port = self._destination_from_socket(client_socket)
-        smtp_input_lines: List[str] = []
+        transcript = SessionTranscript()
         auth_events: List[Dict[str, Any]] = []
         mail_events: List[Dict[str, Any]] = []
         errors: List[str] = []
@@ -706,12 +777,16 @@ class SMTPHoneypot:
         reader = SMTPLineReader(client_socket)
 
         try:
-            self._send(client_socket, f"220 {self.server_name} ESMTP Service Ready\r\n")
+            self._send(
+                client_socket,
+                f"220 {self.server_name} ESMTP Service Ready\r\n",
+                transcript,
+            )
             error_count = 0
 
             while error_count < 10:
                 try:
-                    raw_line = self._read_client_line(reader, smtp_input_lines)
+                    raw_line = self._read_client_line(reader, transcript)
                     if raw_line is None:
                         break
 
@@ -730,7 +805,7 @@ class SMTPHoneypot:
                             if command == "EHLO"
                             else f"250 {self.server_name}\r\n"
                         )
-                        self._send(client_socket, response)
+                        self._send(client_socket, response, transcript)
                         error_count = 0
 
                     elif upper.startswith("MAIL FROM"):
@@ -747,20 +822,20 @@ class SMTPHoneypot:
                                 dest_ip=dest_ip,
                                 dest_port=dest_port,
                                 session_start=session_start,
-                                smtp_input_lines=smtp_input_lines,
+                                transcript=transcript,
                                 errors=errors,
                                 tls_info=tls_info,
                             ):
                                 suppress_final_log = True
                                 break
-                        self._send(client_socket, "250 2.1.0 OK\r\n")
+                        self._send(client_socket, "250 2.1.0 OK\r\n", transcript)
                         error_count = 0
 
                     elif upper.startswith("RCPT TO"):
                         recipient = _extract_smtp_path(stripped)
                         if recipient:
                             envelope_to.append(recipient)
-                        self._send(client_socket, "250 2.1.5 OK\r\n")
+                        self._send(client_socket, "250 2.1.5 OK\r\n", transcript)
                         error_count = 0
 
                     elif command == "DATA":
@@ -775,7 +850,7 @@ class SMTPHoneypot:
                                 dest_ip=dest_ip,
                                 dest_port=dest_port,
                                 session_start=session_start,
-                                smtp_input_lines=smtp_input_lines,
+                                transcript=transcript,
                                 errors=errors,
                                 tls_info=tls_info,
                             ):
@@ -794,7 +869,7 @@ class SMTPHoneypot:
                                 dest_ip=dest_ip,
                                 dest_port=dest_port,
                                 session_start=session_start,
-                                smtp_input_lines=smtp_input_lines,
+                                transcript=transcript,
                                 errors=errors,
                                 tls_info=tls_info,
                             ):
@@ -804,6 +879,7 @@ class SMTPHoneypot:
                         self._send(
                             client_socket,
                             "354 End data with <CR><LF>.<CR><LF>\r\n",
+                            transcript,
                         )
                         body, terminator_found = reader.read_data(
                             self.max_mail_body_bytes
@@ -846,7 +922,7 @@ class SMTPHoneypot:
                             self.rate_limiter.record_message(src_ip, envelope_from)
 
                         if terminator_found:
-                            self._send(client_socket, "250 2.0.0 Ok\r\n")
+                            self._send(client_socket, "250 2.0.0 Ok\r\n", transcript)
                             envelope_from = None
                             envelope_to = []
                             error_count = 0
@@ -854,10 +930,17 @@ class SMTPHoneypot:
                             self._send(
                                 client_socket,
                                 "552 5.3.4 Message size limit exceeded\r\n",
+                                transcript,
                             )
+                            transcript.outcome = "error"
                             break
                         else:
-                            self._send(client_socket, "421 4.4.2 Connection closed\r\n")
+                            self._send(
+                                client_socket,
+                                "421 4.4.2 Connection closed\r\n",
+                                transcript,
+                            )
+                            transcript.outcome = "error"
                             break
 
                     elif command == "AUTH":
@@ -869,7 +952,7 @@ class SMTPHoneypot:
                                 reader,
                                 stripped,
                                 auth_events,
-                                smtp_input_lines,
+                                transcript,
                             ):
                                 break
                             error_count = 0
@@ -879,7 +962,7 @@ class SMTPHoneypot:
                                 reader,
                                 stripped,
                                 auth_events,
-                                smtp_input_lines,
+                                transcript,
                             ):
                                 break
                             error_count = 0
@@ -887,21 +970,26 @@ class SMTPHoneypot:
                             self._send(
                                 client_socket,
                                 "504 5.5.4 Unrecognized authentication type\r\n",
+                                transcript,
                             )
                             error_count += 1
 
                     elif command == "RSET":
                         envelope_from = None
                         envelope_to = []
-                        self._send(client_socket, "250 2.0.0 OK\r\n")
+                        self._send(client_socket, "250 2.0.0 OK\r\n", transcript)
                         error_count = 0
 
                     elif command == "NOOP":
-                        self._send(client_socket, "250 2.0.0 OK\r\n")
+                        self._send(client_socket, "250 2.0.0 OK\r\n", transcript)
                         error_count = 0
 
                     elif command == "VRFY":
-                        self._send(client_socket, "252 2.0.0 Cannot VRFY user\r\n")
+                        self._send(
+                            client_socket,
+                            "252 2.0.0 Cannot VRFY user\r\n",
+                            transcript,
+                        )
                         error_count = 0
 
                     elif command == "STARTTLS":
@@ -909,6 +997,7 @@ class SMTPHoneypot:
                             self._send(
                                 client_socket,
                                 "503 5.5.1 TLS is already active\r\n",
+                                transcript,
                             )
                             error_count += 1
                             continue
@@ -916,6 +1005,7 @@ class SMTPHoneypot:
                             self._send(
                                 client_socket,
                                 "454 4.7.0 TLS not available\r\n",
+                                transcript,
                             )
                             error_count += 1
                             continue
@@ -923,13 +1013,16 @@ class SMTPHoneypot:
                         self._send(
                             client_socket,
                             "220 2.0.0 Ready to start TLS\r\n",
+                            transcript,
                         )
                         try:
+                            client_socket.settimeout(self._handshake_timeout())
                             client_socket = self.tls_context.wrap_socket(
                                 client_socket,
                                 server_side=True,
                             )
-                        except ssl.SSLError as exc:
+                            client_socket.settimeout(self._idle_timeout())
+                        except (ssl.SSLError, OSError) as exc:
                             errors.append(f"STARTTLS handshake failed: {exc}")
                             logger.info(
                                 "STARTTLS handshake failed from %s:%s: %s",
@@ -937,6 +1030,7 @@ class SMTPHoneypot:
                                 src_port,
                                 exc,
                             )
+                            transcript.outcome = "tls_failed"
                             break
 
                         tls_active = True
@@ -948,13 +1042,14 @@ class SMTPHoneypot:
                         error_count = 0
 
                     elif command == "QUIT":
-                        self._send(client_socket, "221 2.0.0 Goodbye\r\n")
+                        self._send(client_socket, "221 2.0.0 Goodbye\r\n", transcript)
                         break
 
                     else:
                         self._send(
                             client_socket,
                             "502 5.5.2 Error: command not recognized\r\n",
+                            transcript,
                         )
                         error_count += 1
 
@@ -967,16 +1062,23 @@ class SMTPHoneypot:
                         self.conn_timeout,
                     )
                     try:
-                        self._send(client_socket, "421 4.4.2 Connection timed out\r\n")
+                        self._send(
+                            client_socket,
+                            "421 4.4.2 Connection timed out\r\n",
+                            transcript,
+                        )
                     except OSError:
                         pass
+                    transcript.outcome = "timeout"
                     break
                 except ValueError as exc:
                     errors.append(str(exc))
-                    self._send(client_socket, "500 5.5.2 Line too long\r\n")
+                    transcript.outcome = "error"
+                    self._send(client_socket, "500 5.5.2 Line too long\r\n", transcript)
                     break
                 except OSError as exc:
                     errors.append(f"client disconnected: {exc}")
+                    transcript.outcome = "error"
                     logger.info(
                         "Connection from %s:%s closed during SMTP handling: %s",
                         src_ip,
@@ -986,13 +1088,16 @@ class SMTPHoneypot:
                     break
                 except Exception as exc:
                     errors.append(f"handler error: {exc}")
+                    transcript.outcome = "error"
                     logger.error("Error handling client request: %s", exc)
                     error_count += 1
         except OSError as exc:
             errors.append(f"client disconnected: {exc}")
+            transcript.outcome = "error"
             logger.info("Client %s:%s disconnected: %s", src_ip, src_port, exc)
         except Exception as exc:
             errors.append(f"client handler failed: {exc}")
+            transcript.outcome = "error"
             logger.error("Error in client handler: %s", exc)
         finally:
             try:
@@ -1009,7 +1114,7 @@ class SMTPHoneypot:
                             dest_port=dest_port,
                             session_start=session_start,
                             session_end=session_end,
-                            smtp_input_lines=smtp_input_lines,
+                            transcript=transcript,
                             auth_events=auth_events,
                             mail_events=mail_events,
                             errors=errors,
